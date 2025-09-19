@@ -19,9 +19,9 @@
 ## Установка
 
 ```bash
-git clone https://github.com/…/gpx2gif.git
-cd gpx2gif
-go build -o gpx2gif
+git clone https://github.com//s0ultr4d3r/psstelebot.git
+cd psstelebot
+go build -o psstelebot
 
 ## Флаги запуска
 
