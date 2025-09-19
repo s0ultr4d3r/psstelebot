@@ -26,6 +26,7 @@ func BuildFramesMulti(
 	margin float64,
 	bg color.Color,
 	trackColors []color.Color,
+	trackWidth int,          // ⬅️ новый параметр
 	base image.Image,
 ) ([]*PalFrame, []int, error) {
 
@@ -62,9 +63,8 @@ func BuildFramesMulti(
 	frames := make([]*PalFrame, 0, total)
 	delays := make([]int, 0, total)
 
-	// Если ни у одного трека нет времени — фоллбэк к синхронизации по индексу (как раньше).
+	// Если ни у одного трека нет времени — синхронизация по индексу
 	if !hasTime {
-		// самый длинный трек задаёт темп
 		maxPts := 0
 		for _, pts := range tracks { if len(pts) > maxPts { maxPts = len(pts) } }
 		if maxPts < 2 { maxPts = 2 }
@@ -89,7 +89,7 @@ func BuildFramesMulti(
 				for i := 0; i < endIdx; i++ {
 					x1, y1 := project(pts[i], bb, sizePx)
 					x2, y2 := project(pts[i+1], bb, sizePx)
-					drawLineRGBA(rgba, x1, y1, x2, y2, 2, col)
+					drawLineRGBA(rgba, x1, y1, x2, y2, trackWidth, col) // ⬅️ толщина
 				}
 			}
 
@@ -106,13 +106,11 @@ func BuildFramesMulti(
 		total = 2
 	}
 	totalDur := maxT.Sub(minT)
-	// курсоры по трекам (ускоряет поиск "до frameT")
-	cursor := make([]int, len(tracks)) // индекс последней точки <= frameT для каждого трека
+	cursor := make([]int, len(tracks)) // индекс последней точки <= frameT
 
 	for fi := 0; fi < total; fi++ {
 		select { case <-ctx.Done(): return nil, nil, ctx.Err(); default: }
 
-		// момент времени кадра
 		var frameT time.Time
 		if fi == total-1 {
 			frameT = maxT
@@ -129,7 +127,6 @@ func BuildFramesMulti(
 
 		for tIdx, pts := range tracks {
 			if len(pts) < 2 { continue }
-			// продвигаем курсор, пока следующая точка не позже frameT
 			i := cursor[tIdx]
 			for i+1 < len(pts) {
 				tNext := pts[i+1].T
@@ -139,19 +136,14 @@ func BuildFramesMulti(
 			cursor[tIdx] = i
 
 			endIdx := i
-			// если все точки до frameT — рисуем весь трек
-			if endIdx >= len(pts)-1 {
-				endIdx = len(pts)-1
-			}
-			if endIdx < 1 { // ещё не стартовал
-				continue
-			}
+			if endIdx >= len(pts)-1 { endIdx = len(pts)-1 }
+			if endIdx < 1 { continue }
 
 			col := trackColors[tIdx%len(trackColors)]
 			for k := 0; k < endIdx; k++ {
 				x1, y1 := project(pts[k], bb, sizePx)
 				x2, y2 := project(pts[k+1], bb, sizePx)
-				drawLineRGBA(rgba, x1, y1, x2, y2, 2, col)
+				drawLineRGBA(rgba, x1, y1, x2, y2, trackWidth, col) // ⬅️ толщина
 			}
 		}
 
@@ -162,6 +154,7 @@ func BuildFramesMulti(
 	}
 	return frames, delays, nil
 }
+
 
 type boundsLL struct {
 	minLat, maxLat float64
