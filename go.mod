@@ -4,6 +4,8 @@ go 1.25.1
 
 require github.com/schollz/progressbar/v3 v3.18.0
 
+require github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1 // indirect
+
 require (
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
