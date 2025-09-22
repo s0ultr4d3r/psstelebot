@@ -1,32 +1,65 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# ========= Project outputs =========
+# GIF animations
+*.gif
+
+# GPX input tracks
+*.gpx
+
+# Partial / temp outputs
+*.part
+*.tmp
+*.temp
+*.bak
+
+# Logs
+*.log
+
+# ========= Tile / map caches =========
+.tile-cache/
+.tilecache/
+tile-cache/
+cache/
+.cache/
+
+# ========= Build artifacts (Go) =========
+/bin/
+/dist/
+/build/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Code coverage profiles and other test artifacts
 *.out
-coverage.*
-*.coverprofile
-profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Go coverage / profiles
+*.cover
+coverage/
+*.pprof
+profile.*
 
-# Go workspace file
+# go workspaces (optional)
 go.work
 go.work.sum
 
-# env file
-.env
+# ========= Test data / fixtures =========
+/testdata/
+*.sample
+*.fixture
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# ========= Editors / OS cruft =========
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ========= Misc =========
+# If you export frames as PNG/JPG during debugging:
+frames/
+*.png
+*.jpg
+*.jpeg
