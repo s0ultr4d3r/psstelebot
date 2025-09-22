@@ -14,7 +14,7 @@ import (
 
 func main() {
 	token := mustEnv("BOT_TOKEN")
-	renderBin := mustEnv("GPX2GIF_BIN") // путь к собранному cmd/gpx2gif
+	renderBin := mustEnv("PSSTELE_BIN") // путь к собранному cmd/gpx2gif
 	workDir := getenv("WORK_DIR", "./work")
 	_ = os.MkdirAll(workDir, 0o755)
 
