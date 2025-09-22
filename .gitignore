@@ -14,6 +14,9 @@
 # Logs
 *.log
 
+# Env
+*.env
+
 # ========= Tile / map caches =========
 .tile-cache/
 .tilecache/
@@ -63,3 +66,4 @@ frames/
 *.png
 *.jpg
 *.jpeg
+.env
