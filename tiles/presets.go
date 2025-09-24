@@ -1,51 +1,99 @@
 package tiles
 
-import (
-	"fmt"
-	"net/url"
-	"strings"
-)
+import "strings"
 
+// Preset описывает источник тайлов.
 type Preset struct {
 	Name        string
-	URLTmpl     string // .../{z}/{x}/{y}.png
+	URLTmpl     string            // .../{z}/{x}/{y}.png (или jpg); допускается порядок {z}/{y}/{x}
 	Attribution string
 	MinZoom     int
 	MaxZoom     int
-	Headers     map[string]string // optional
+	Headers     map[string]string // опционально: дополнительные HTTP-заголовки
 }
 
+// FillURL — заполнение плейсхолдеров.
+// ВОЗВРАЩАЕТ (string, error), как ожидает fetcher.go.
+func (p Preset) FillURL(z, x, y int) (string, error) {
+	return Sub(p.URLTmpl, z, x, y), nil
+}
+
+// Sub — универсальная подстановка {z},{x},{y}.
+func Sub(tmpl string, z, x, y int) string {
+	s := tmpl
+	s = strings.ReplaceAll(s, "{z}", itoa(z))
+	s = strings.ReplaceAll(s, "{x}", itoa(x))
+	s = strings.ReplaceAll(s, "{y}", itoa(y))
+	return s
+}
+
+func itoa(i int) string {
+	const digits = "0123456789"
+	if i == 0 {
+		return "0"
+	}
+	n := i
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var b [20]byte
+	pos := len(b)
+	for n > 0 {
+		pos--
+		b[pos] = digits[n%10]
+		n /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
+}
+
+// Готовые пресеты. Можно дополнять.
 var Presets = map[string]Preset{
 	"opentopomap": {
-		Name:        "OpenTopoMap",
-		URLTmpl:     "https://tile.opentopomap.org/{z}/{x}/{y}.png",
-		Attribution: "© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors",
+		Name:        "opentopomap",
+		URLTmpl:     "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenTopoMap (CC-BY-SA) — Data © OpenStreetMap contributors (ODbL)",
 		MinZoom:     0, MaxZoom: 17,
 	},
+	"stamen-terrain-bg": {
+		Name:        "stamen-terrain-bg",
+		URLTmpl:     "https://tile.stamen.com/terrain-background/{z}/{x}/{y}.jpg",
+		Attribution: "Map tiles by Stamen Design (CC BY 3.0) — Data © OpenStreetMap contributors (ODbL)",
+		MinZoom:     0, MaxZoom: 18,
+	},
 	"esri-satellite": {
-		Name:        "ESRI World Imagery",
-		URLTmpl:     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-		Attribution: "© Esri, Maxar, Earthstar Geographics",
-		MinZoom:     0, MaxZoom: 20,
+		Name:        "esri-satellite",
+		URLTmpl:     "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+		Attribution: "Source: Esri — Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+		MinZoom:     0, MaxZoom: 19,
+		Headers:     map[string]string{"User-Agent": "psstelebot/gpx2gif"},
 	},
 	"maptiler-satellite": {
-		Name:        "MapTiler Satellite",
-		URLTmpl:     "https://api.maptiler.com/tiles/satellite/{z}/{x}/{y}.jpg?key=${MAPTILER_KEY}",
-		Attribution: "© MapTiler, © OpenStreetMap contributors, © NASA",
+		Name:        "maptiler-satellite",
+		URLTmpl:     "https://api.maptiler.com/tiles/satellite/{z}/{x}/{y}.jpg?key=YOUR_KEY",
+		Attribution: "© MapTiler © OpenStreetMap contributors",
 		MinZoom:     0, MaxZoom: 20,
 	},
-	"stamen-terrain-bg": {
-		Name:        "Stadia Stamen Terrain BG",
-		URLTmpl:     "https://tiles.stadiamaps.com/tiles/stamen_terrain_background/{z}/{x}/{y}.png?api_key=${STADIA_KEY}",
-		Attribution: "© Stadia Maps, © Stamen Design, © OpenStreetMap contributors",
-		MinZoom:     0, MaxZoom: 18,
+	"osm": {
+		Name:        "osm",
+		URLTmpl:     "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors (ODbL)",
+		MinZoom:     0, MaxZoom: 19,
 	},
 }
 
-func (p Preset) FillURL(z, x, y int) (string, error) {
-	u := strings.ReplaceAll(p.URLTmpl, "{z}", fmt.Sprintf("%d", z))
-	u = strings.ReplaceAll(u, "{x}", fmt.Sprintf("%d", x))
-	u = strings.ReplaceAll(u, "{y}", fmt.Sprintf("%d", y))
-	_, err := url.Parse(u)
-	return u, err
+// URLFromPreset: быстрый маппер “имя пресета → URL” с оверрайдом.
+func URLFromPreset(name, override string) string {
+	if override != "" {
+		return override
+	}
+	if p, ok := Presets[name]; ok {
+		return p.URLTmpl
+	}
+	return Presets["osm"].URLTmpl
 }

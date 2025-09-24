@@ -1,92 +1,69 @@
 package tiles
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"image"
-	"image/jpeg"
-	"image/png"
 	"math"
+	"sync"
 
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"golang.org/x/image/draw"
 )
 
-// BuildMosaic fetches all tiles covering bbox and assembles into an RGBA image.
-// It returns the mosaic and the actual zoom used.
-func BuildMosaic(
-	ctx context.Context,
-	f *Fetcher,
-	preset Preset,
-	minLon, minLat, maxLon, maxLat float64,
-	targetW, targetH int,
-) (*image.RGBA, int, error) {
+// ComposeMosaic renders a tile mosaic for a given world rectangle (in "tile pixels"
+// at zoom z) into a square canvas. Returns the canvas, origin of the world rect
+// (in tile px), and scale factor (canvas/world).
+func ComposeMosaic(tl *Loader, presetURL string, z int, worldRect image.Rectangle, canvas, tile int) (*image.RGBA, image.Point, float64, error) {
+	scale := float64(canvas) / float64(max(worldRect.Dx(), worldRect.Dy()))
+	dst := image.NewRGBA(image.Rect(0, 0, canvas, canvas))
 
-	// pick zoom to fit into target size
-	z := FitZoom(minLon, minLat, maxLon, maxLat, targetW, targetH, preset)
-	z = ClampZoom(z, preset)
+	minTx := int(math.Floor(float64(worldRect.Min.X) / float64(tile)))
+	maxTx := int(math.Floor(float64(worldRect.Max.X-1) / float64(tile)))
+	minTy := int(math.Floor(float64(worldRect.Min.Y) / float64(tile)))
+	maxTy := int(math.Floor(float64(worldRect.Max.Y-1) / float64(tile)))
 
-	// world-pixel bbox at chosen zoom
-	tlx, tly, brx, bry := BBoxPixels(minLon, minLat, maxLon, maxLat, z)
-	w := int(math.Ceil(brx - tlx))
-	h := int(math.Ceil(bry - tly))
-	if w <= 0 || h <= 0 {
-		return nil, z, fmt.Errorf("invalid mosaic size %dx%d", w, h)
+	type job struct {
+		tx, ty int
+		im     image.Image
+		err    error
 	}
-	if w > targetW || h > targetH {
-		// safety (shouldn't happen with FitZoom)
-		w, h = targetW, targetH
-	}
+	ch := make(chan job, (maxTx-minTx+1)*(maxTy-minTy+1))
+	var wg sync.WaitGroup
 
-	out := image.NewRGBA(image.Rect(0, 0, w, h))
-
-	// range of tiles to fetch
-	minTX, minTY, maxTX, maxTY := CoveringTiles(minLon, minLat, maxLon, maxLat, z)
-
-	for ty := minTY; ty <= maxTY; ty++ {
-		for tx := minTX; tx <= maxTX; tx++ {
-			u, hdrs, err := f.URLFor(preset, z, tx, ty)
-			if err != nil {
-				return nil, z, err
-			}
-			data, _, err := f.GetTile(ctx, u, hdrs)
-			if err != nil {
-				return nil, z, fmt.Errorf("get tile %s: %w", u, err)
-			}
-
-			img, _, err := decodeTile(data)
-			if err != nil {
-				return nil, z, fmt.Errorf("decode tile %s: %w", u, err)
-			}
-
-			// where to paste this tile in mosaic?
-			// compute top-left world-pixel of tile
-			tilePx := float64(tx * TileSize)
-			tilePy := float64(ty * TileSize)
-
-			// offset in mosaic:
-			offX := int(tilePx - tlx)
-			offY := int(tilePy - tly)
-
-			Paste(out, img, offX, offY)
+	for ty := minTy; ty <= maxTy; ty++ {
+		for tx := minTx; tx <= maxTx; tx++ {
+			wg.Add(1)
+			go func(tx, ty int) {
+				defer wg.Done()
+				u := Sub(presetURL, z, tx, ty)
+				im, err := tl.GetImage(u)
+				ch <- job{tx: tx, ty: ty, im: im, err: err}
+			}(tx, ty)
 		}
 	}
-	return out, z, nil
+	go func() { wg.Wait(); close(ch) }()
+
+	for j := range ch {
+		if j.err != nil {
+			return nil, image.Point{}, 1.0, j.err
+		}
+		srcRect := image.Rect(j.tx*tile, j.ty*tile, (j.tx+1)*tile, (j.ty+1)*tile)
+		inter := srcRect.Intersect(worldRect)
+		if inter.Empty() {
+			continue
+		}
+		dr := image.Rect(
+			int(math.Round(float64(inter.Min.X-worldRect.Min.X)*scale)),
+			int(math.Round(float64(inter.Min.Y-worldRect.Min.Y)*scale)),
+			int(math.Round(float64(inter.Max.X-worldRect.Min.X)*scale)),
+			int(math.Round(float64(inter.Max.Y-worldRect.Min.Y)*scale)),
+		)
+		sr := image.Rect(inter.Min.X-srcRect.Min.X, inter.Min.Y-srcRect.Min.Y, inter.Max.X-srcRect.Min.X, inter.Max.Y-srcRect.Min.Y)
+		draw.CatmullRom.Scale(dst, dr, j.im, sr, draw.Over, nil)
+	}
+
+	return dst, worldRect.Min, scale, nil
 }
 
-func decodeTile(b []byte) (image.Image, string, error) {
-	// Fast path: check first bytes for PNG/JPEG
-	if len(b) >= 8 && bytes.Equal(b[:8], []byte{137, 80, 78, 71, 13, 10, 26, 10}) {
-		img, err := png.Decode(bytes.NewReader(b))
-		return img, "image/png", err
-	}
-	if len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
-		img, err := jpeg.Decode(bytes.NewReader(b))
-		return img, "image/jpeg", err
-	}
-	// fallback to image.Decode (slower, but robust)
-	img, format, err := image.Decode(bytes.NewReader(b))
-	return img, format, err
+func max(a, b int) int {
+	if a > b { return a }
+	return b
 }

@@ -58,9 +58,9 @@ var (
 	tileFit = flag.String("tileFit", "contain", "fit mode for static map background: contain | cover")
 
 	// ретраи/зумы
-	tilesMaxZ        = flag.Int("tilesMaxZoom", -1, "override max tile zoom for the preset (-1 = preset default)")
-	tilesMinZ        = flag.Int("tilesMinZoom", 10, "lower bound for auto downscale when 404 (inclusive)")
-	tilesRetries     = flag.Int("tilesRetries", 3, "retry attempts for non-404 tile errors")
+	tilesMaxZ         = flag.Int("tilesMaxZoom", -1, "override max tile zoom for the preset (-1 = preset default)")
+	tilesMinZ         = flag.Int("tilesMinZoom", 10, "lower bound for auto downscale when 404 (inclusive)")
+	tilesRetries      = flag.Int("tilesRetries", 3, "retry attempts for non-404 tile errors")
 	tilesRetryBackoff = flag.Duration("tilesRetryBackoff", 2*time.Second, "initial backoff for tile retries (exponential)")
 
 	timeout = flag.Duration("timeout", 10*time.Minute, "жёсткий таймаут всего процесса")
@@ -193,10 +193,10 @@ func run(
 	}
 
 	// 1) градусы -> меркатор (нормализованный [0..1])
-	x0 := mercX(bb.minLon)
-	x1 := mercX(bb.maxLon)
-	yTop := mercY(bb.maxLat) // верх (численно меньше)
-	yBot := mercY(bb.minLat) // низ  (численно больше)
+	x0 := tiles.MercX(bb.minLon)
+	x1 := tiles.MercX(bb.maxLon)
+	yTop := tiles.MercY(bb.maxLat) // верх (численно меньше)
+	yBot := tiles.MercY(bb.minLat) // низ  (численно больше)
 
 	// 2) делаем квадрат "contain-квадратом": РАСШИРЯЕМ меньшую сторону (ничего не режем!)
 	dx := x1 - x0
@@ -322,13 +322,22 @@ func run(
 			tiles.DrawAttribution(dst, preset.Attribution)
 		}
 	}
+// имена треков для легенды/HUD
+trackNames := make([]string, len(tracks))
+for i := range tracks {
+    trackNames[i] = filepath.Base(inPaths[i])
+}
+delayCS := int(math.Max(1, math.Round(100.0/float64(totalFrames))))
 
 	// ---------- КАДРЫ ОТРИСОВКИ ТРЕКОВ ----------
 	frames, delays, err := BuildFramesMulti(
 		ctx, tracks, px, totalFrames, margin,
 		bg, trackColors, *lineWidth, baseImg,
-		bbLLFit, // единый viewport
+		bbLLFit,              // единый viewport
+		trackNames,           // <<< новый аргумент
+		delayCS, // <<< НОВЫЙ аргумент
 	)
+	
 	if err != nil {
 		return fmt.Errorf("build frames: %w", err)
 	}
@@ -369,26 +378,7 @@ func run(
 		}
 	}
 
-	// ---------- дорисовываем HUD поверх каждого кадра ----------
-	if *showLegend || *showSpeed {
-		for i := range frames {
-			dst := frames[i].Img // *image.Paletted (implements draw.Image)
-			if *showLegend {
-				hudDrawLegend(dst, hudTracks)
-			}
-			if *showSpeed && hasTime && t1.After(t0) {
-				var tNow time.Time
-				if i == len(frames)-1 {
-					tNow = t1
-				} else {
-					f := float64(i) / float64(len(frames)-1)
-					tNow = t0.Add(time.Duration(f * float64(t1.Sub(t0))))
-				}
-				hudDrawSpeeds(dst, hudTracks, tNow, *speedUnits)
-			}
-		}
-	}
-
+	
 	// ---------- запись GIF ----------
 	tmpOut := outPath + ".part"
 	if err := encodeGIF(ctx, frames, delays, tmpOut, func(i int) { bars.SetGIF(i + 1) }); err != nil {
@@ -503,6 +493,7 @@ func encodeGIF(ctx context.Context, frames []*PalFrame, delays []int, outPath st
 	}
 	return writeGIFAll(f, frames, delays)
 }
+
 
 // --- copyFile: fallback, если os.Rename не сработал (разные FS и т.п.)
 func copyFile(src, dst string) error {
@@ -660,4 +651,12 @@ func convertSpeed(vMS float64, units string) float64 {
 	default: // "ms"
 		return vMS
 	}
+}
+
+// --- обратная проекция WebMercator y → lat (в градусах)
+func invMercY(y float64) float64 {
+	// y в нормализованных координатах [0..1]
+	t := math.Pi * (1 - 2*y)
+	latRad := math.Atan(math.Sinh(t))
+	return latRad * 180 / math.Pi
 }

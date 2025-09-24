@@ -1,12 +1,11 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,570 +18,451 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-type Session struct {
-	Files      []string
-	UpdatedAt  time.Time
-	LastUserID int64  // кто вызывал команду
-	LastUser   string // username (без @), если есть
+/*************** Конфиг ****************/
+
+var rendererPath = "./bin/psstelebot"
+
+var defaultRender = renderConfig{
+	Size:           1024,
+	FPS:            20,
+	Duration:       "15s",
+	TilesPreset:    "opentopomap",
+	TilesURL:       "",
+	TilesMaxZoom:   16,
+	TilesMinZoom:   12,
+	TilesRetries:   3,
+	TilesRetryBack: "2s",
+	TilesTimeout:   "45s",
+	TilesRPS:       0.5,
+	TilesBurst:     1,
+	TileFit:        "cover",
+	Margin:         0.02,
+	LineColors:     "#e74c3c,#3498db",
+	SpeedOverlay:   true,
+	SpeedUnits:     "kmh",
+	SpeedSmooth:    1,
+	LineWidth:      4,
+	GlobalTimeout:  "60m",
+	ShowLegend:     true,
 }
 
+type renderConfig struct {
+	Size           int
+	FPS            int
+	Duration       string
+	TilesPreset    string
+	TilesURL       string
+	TilesMaxZoom   int
+	TilesMinZoom   int
+	TilesRetries   int
+	TilesRetryBack string
+	TilesTimeout   string
+	TilesRPS       float64
+	TilesBurst     int
+	TileFit        string
+	Margin         float64
+	LineColors     string
+	SpeedOverlay   bool
+	SpeedUnits     string
+	SpeedSmooth    int
+	LineWidth      int
+	GlobalTimeout  string
+	ShowLegend     bool
+}
+
+func (c renderConfig) args(out string, inputs []string) []string {
+	args := []string{
+		"-size", strconv.Itoa(c.Size),
+		"-fps", strconv.Itoa(c.FPS),
+		"-duration", c.Duration,
+		"-tilesMaxZoom", strconv.Itoa(c.TilesMaxZoom),
+		"-tilesMinZoom", strconv.Itoa(c.TilesMinZoom),
+		"-tilesRetries", strconv.Itoa(c.TilesRetries),
+		"-tilesRetryBackoff", c.TilesRetryBack,
+		"-tilesTimeout", c.TilesTimeout,
+		"-tilesRPS", fmt.Sprintf("%g", c.TilesRPS),
+		"-tilesBurst", strconv.Itoa(c.TilesBurst),
+		"-tileFit", c.TileFit,
+		"-margin", fmt.Sprintf("%g", c.Margin),
+		"-lineColors", c.LineColors,
+		"-speedUnits", c.SpeedUnits,
+		"-speedSmooth", strconv.Itoa(c.SpeedSmooth),
+		"-lineWidth", strconv.Itoa(c.LineWidth),
+		"-timeout", c.GlobalTimeout,
+	}
+	if c.TilesURL != "" {
+		args = append(args, "-tilesURL", c.TilesURL)
+	} else {
+		args = append(args, "-tilesPreset", c.TilesPreset)
+	}
+	if c.SpeedOverlay {
+		args = append(args, "-speedOverlay")
+	}
+	if c.ShowLegend {
+		args = append(args, "-legend")
+	}
+	for _, in := range inputs {
+		args = append(args, "-in", in)
+	}
+	args = append(args, "-out", out)
+	return args
+}
+
+/*************** Состояние на чат ****************/
+
 var (
-	bot         *tgbotapi.BotAPI
-	pssBin      string
-	workDir     string
-	sessionTTL  = 45 * time.Minute
-	sessions    = map[int64]*Session{} // chatID -> session
-	sessMu      sync.Mutex
-	renderSlots = make(chan struct{}, 2) // одновременно не более 2 рендеров
-
-	debugAdmins = map[int64]bool{}  // по userID
-	debugUsers  = map[string]bool{} // по username (lower)
-
-	mainKB tgbotapi.ReplyKeyboardMarkup
+	build   = "dev"
+	mu      sync.Mutex
+	perChat = map[int64]*chatState{}
 )
+
+type chatState struct {
+	cfg   renderConfig
+	files []string
+}
+
+func state(chatID int64) *chatState {
+	mu.Lock()
+	defer mu.Unlock()
+	if s, ok := perChat[chatID]; ok {
+		return s
+	}
+	cp := defaultRender
+	s := &chatState{cfg: cp}
+	perChat[chatID] = s
+	return s
+}
+
+func (s *chatState) enqueue(path string) {
+	mu.Lock()
+	defer mu.Unlock()
+	s.files = append(s.files, path)
+}
+
+func (s *chatState) clearFiles() (cleared []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	cleared = s.files
+	s.files = nil
+	return
+}
+
+/*************** Клавиатура (ReplyKeyboard) ****************/
 
 const (
-	maxBotUpload = 48 * 1024 * 1024 // ~48MB запас к лимиту Telegram (50MB)
-
-	btnTop = "🗺️ Топографическая карта"
-	btnSat = "🛰️ Спутниковая карта"
+	btnTopoText = "🗺️ Топографическая карта"
+	btnSatText  = "🛰️ Спутниковая карта"
 )
 
-// ---------- MAIN ----------
-
-func main() {
-	token := mustEnv("BOT_TOKEN")
-	pssBin = mustEnv("PSSTELE_BIN")
-	workDir = getenv("WORK_DIR", "./.work")
-	_ = os.MkdirAll(workDir, 0o755)
-
-	// DEBUG_ADMINS="12345,@user1,67890,@user2"
-	parseDebugAdmins(getenv("DEBUG_ADMINS", ""))
-
-	// reply-клавиатура
-	mainKB = tgbotapi.NewReplyKeyboard(
+func bottomKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton(btnTop),
-			tgbotapi.NewKeyboardButton(btnSat),
+			tgbotapi.NewKeyboardButton(btnTopoText),
+			tgbotapi.NewKeyboardButton(btnSatText),
 		),
 	)
-	mainKB.ResizeKeyboard = true
-	mainKB.OneTimeKeyboard = false
-	mainKB.Selective = false
+}
 
-	// HTTP-клиент без keep-alive/HTTP2 для стабильного long-polling
-	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   20 * time.Second,
-			KeepAlive: 20 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		DisableKeepAlives:   true,
-		ForceAttemptHTTP2:   false,
+/*************** Бот ****************/
+
+func main() {
+	token := os.Getenv("BOT_TOKEN")
+	if token == "" {
+		log.Fatal("BOT_TOKEN is empty")
 	}
-	httpClient := &http.Client{Transport: tr}
+	if _, err := os.Stat(rendererPath); err != nil {
+		log.Fatalf("renderer not found: %s", rendererPath)
+	}
 
-	var err error
-	bot, err = tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, httpClient)
-	must(err)
-
-	go gcSessions()
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("psstelebot-bot build=%s authorized on %s", build, bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 50
+	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
 	for upd := range updates {
-		if upd.Message == nil {
-			continue
-		}
-		m := upd.Message
-		chatID := m.Chat.ID
-
-		// Команды
-		if m.IsCommand() {
-			switch m.Command() {
-			case "start", "help":
-				sendKB(chatID, helpText())
-			case "clear":
-				clearSession(chatID)
-				sendKB(chatID, "🧼 Сессия очищена. Пришлите 1..N GPX, затем выберите кнопку ниже.")
-			case "rendertop":
-				markInvoker(chatID, m)
-				doRender(chatID, "opentopomap", m)
-			case "rendersat":
-				markInvoker(chatID, m)
-				doRender(chatID, "esri-satellite", m)
-			default:
-				sendKB(chatID, "Неизвестная команда. Нажмите одну из кнопок ниже или /help.")
-			}
-			continue
-		}
-
-		// Нажатия на кнопки (приходят как обычный текст)
-		if m.Text == btnTop {
-			markInvoker(chatID, m)
-			doRender(chatID, "opentopomap", m)
-			continue
-		}
-		if m.Text == btnSat {
-			markInvoker(chatID, m)
-			doRender(chatID, "esri-satellite", m)
-			continue
-		}
-
-		// Приём GPX
-		if d := m.Document; d != nil {
-			name := strings.ToLower(d.FileName)
-			if !strings.HasSuffix(name, ".gpx") {
-				sendKB(chatID, "📄 Это не GPX. Пришлите .gpx файл(ы) или нажмите кнопку ниже.")
-				continue
-			}
-			dst := filepath.Join(workDir, fmt.Sprintf("%d_%s", chatID, sanitize(d.FileName)))
-			if err := downloadTGFile(d.FileID, dst); err != nil {
-				sendKB(chatID, "❌ Не удалось скачать файл: "+err.Error())
-				continue
-			}
-			addFile(chatID, dst)
-			sendKB(chatID, fmt.Sprintf("✅ GPX добавлен: %s\nКогда готовы — нажмите кнопку ниже:", filepath.Base(dst)))
-			continue
+		if upd.Message != nil {
+			go handleMessage(bot, upd.Message)
 		}
 	}
 }
 
-// ---------- RENDER ----------
+/*************** Handlers ****************/
 
-func doRender(chatID int64, tilesPreset string, m *tgbotapi.Message) {
-	sessMu.Lock()
-	s := sessions[chatID]
-	sessMu.Unlock()
+func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	st := state(chatID)
 
-	if s == nil || len(s.Files) == 0 {
-		sendKB(chatID, "⚠️ В сессии нет GPX. Пришлите 1..N файлов, затем нажмите кнопку ниже.")
+	// Команды
+	if msg.IsCommand() {
+		switch msg.Command() {
+		case "start":
+			txt := "Пришлите один или несколько GPX *как документы* (можно альбомом). " +
+				"Когда будете готовы — нажмите кнопку внизу: «Топографическая карта» или «Спутниковая карта» — это и выберет карту, и запустит рендер.\n\n" +
+				"Все параметры — в /help"
+			m := tgbotapi.NewMessage(chatID, txt)
+			m.ParseMode = "Markdown"
+			kbd := bottomKeyboard()
+			kbd.ResizeKeyboard = true
+			m.ReplyMarkup = kbd
+			_, _ = bot.Send(m)
+			return
+
+		case "help":
+			_ = sendText(bot, chatID,
+				"*Опции:*\n"+
+					"`/size 1536`, `/fps 20`, `/duration 12s`\n"+
+					"`/linewidth 4`, `/colors #e74c3c,#3498db`\n"+
+					"`/legend on|off`, `/speed on|off`\n"+
+					"`/list` — показать очередь, `/clear` — очистить.\n\n"+
+					"Кнопки внизу запускают отрисовку и выбирают карту.",
+				true)
+			return
+
+		case "list":
+			mu.Lock()
+			files := append([]string(nil), st.files...)
+			mu.Unlock()
+			if len(files) == 0 {
+				_ = sendText(bot, chatID, "Очередь пуста.", false)
+			} else {
+				var b strings.Builder
+				for _, f := range files {
+					b.WriteString("• ")
+					b.WriteString(filepath.Base(f))
+					b.WriteByte('\n')
+				}
+				_ = sendText(bot, chatID, "*В очереди:*\n"+b.String(), true)
+			}
+			return
+
+		case "clear":
+			toDel := st.clearFiles()
+			cleanTemp(toDel)
+			_ = sendText(bot, chatID, "Очередь очищена.", false)
+			return
+
+		case "size":
+			if v, err := strconv.Atoi(strings.TrimSpace(msg.CommandArguments())); err == nil && v >= 256 && v <= 4096 {
+				st.cfg.Size = v
+				_ = sendText(bot, chatID, fmt.Sprintf("size=%d", v), false)
+			}
+			return
+
+		case "fps":
+			if v, err := strconv.Atoi(strings.TrimSpace(msg.CommandArguments())); err == nil && v >= 1 && v <= 60 {
+				st.cfg.FPS = v
+				_ = sendText(bot, chatID, fmt.Sprintf("fps=%d", v), false)
+			}
+			return
+
+		case "duration":
+			a := strings.TrimSpace(msg.CommandArguments())
+			if a != "" {
+				st.cfg.Duration = a
+				_ = sendText(bot, chatID, "duration="+a, false)
+			}
+			return
+
+		case "linewidth":
+			if v, err := strconv.Atoi(strings.TrimSpace(msg.CommandArguments())); err == nil && v >= 1 && v <= 20 {
+				st.cfg.LineWidth = v
+				_ = sendText(bot, chatID, fmt.Sprintf("lineWidth=%d", v), false)
+			}
+			return
+
+		case "colors":
+			a := strings.TrimSpace(msg.CommandArguments())
+			if a != "" {
+				st.cfg.LineColors = a
+				_ = sendText(bot, chatID, "colors="+a, false)
+			}
+			return
+
+		case "legend":
+			a := strings.TrimSpace(msg.CommandArguments())
+			if a == "on" {
+				st.cfg.ShowLegend = true
+			} else if a == "off" {
+				st.cfg.ShowLegend = false
+			}
+			_ = sendText(bot, chatID, fmt.Sprintf("legend=%v", st.cfg.ShowLegend), false)
+			return
+
+		case "speed":
+			a := strings.TrimSpace(msg.CommandArguments())
+			if a == "on" {
+				st.cfg.SpeedOverlay = true
+			} else if a == "off" {
+				st.cfg.SpeedOverlay = false
+			}
+			_ = sendText(bot, chatID, fmt.Sprintf("speedOverlay=%v", st.cfg.SpeedOverlay), false)
+			return
+		}
+	}
+
+	// Нажатия кнопок нижней клавиатуры (обычный текст)
+	switch msg.Text {
+	case btnTopoText:
+		st.cfg.TilesPreset = "opentopomap"
+		st.cfg.TilesURL = ""
+		runRenderNow(bot, chatID)
+		return
+	case btnSatText:
+		st.cfg.TilesPreset = "esri-satellite"
+		st.cfg.TilesURL = ""
+		runRenderNow(bot, chatID)
 		return
 	}
 
-	send(chatID, fmt.Sprintf("🛠️ Готовлюсь к рендеру… (preset: %s), файлов: %d", tilesPreset, len(s.Files)))
-	dbg := newDebugStreamer(chatID, m)
-
-	// фикс-параметры
-	outPath := filepath.Join(workDir, time.Now().Format("20060102_150405")+".gif")
-	args := []string{
-		"-out", outPath,
-		"-size", "1024",
-		"-fps", "20",
-		"-duration", "15s",
-		"-tilesMaxZoom", "16",
-		"-tilesMinZoom", "12",
-		"-tilesRetries", "3",
-		"-tilesRetryBackoff", "2s",
-		"-tilesTimeout", "45s",
-		"-tilesRPS", "0.5",
-		"-tilesBurst", "1",
-		"-tileFit", "cover",
-		"-margin", "0.02",
-		"-lineColors", "#e74c3c,#3498db",
-		"-speedOverlay",
-		"-speedUnits", "kmh",
-		"-speedSmooth", "1",
-		"-lineWidth", "3",
-		"-timeout", "60m",
-		"-tilesPreset", tilesPreset,
+	// Документ .gpx — только добавляем в очередь, без автозапуска
+	if msg.Document != nil && msg.Document.FileID != "" {
+		if !strings.HasSuffix(strings.ToLower(msg.Document.FileName), ".gpx") {
+			_ = sendText(bot, chatID, "Это не .gpx. Пришлите GPX как документ.", false)
+			return
+		}
+		path := maybeDownload(bot, msg.Document)
+		if path != "" {
+			st.enqueue(path)
+			mu.Lock()
+			n := len(st.files)
+			mu.Unlock()
+			txt := fmt.Sprintf("Добавлен: *%s*\nВ очереди теперь %d файл(ов). Нажмите кнопку внизу для старта.",
+				filepath.Base(path), n)
+			m := tgbotapi.NewMessage(chatID, txt)
+			m.ParseMode = "Markdown"
+			// клавиатуру снизу держим постоянно — не нужно добавлять её к каждому сообщению
+			_, _ = bot.Send(m)
+		} else {
+			_ = sendText(bot, chatID, "Не удалось скачать файл.", false)
+		}
 	}
-	for _, f := range s.Files {
-		args = append(args, "-in", f)
+}
+
+/*************** Рендер ****************/
+
+func runRenderNow(bot *tgbotapi.BotAPI, chatID int64) {
+	st := state(chatID)
+
+	mu.Lock()
+	files := append([]string(nil), st.files...)
+	cfg := st.cfg
+	mu.Unlock()
+
+	if len(files) == 0 {
+		_ = sendText(bot, chatID, "Очередь пуста. Пришлите один или несколько GPX.", false)
+		return
 	}
 
-	dbg.Println("CMD:", pssBin, strings.Join(args, " "))
-
-	// ограничение параллельности
-	renderSlots <- struct{}{}
-	defer func() { <-renderSlots }()
-
-	// поверх -timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, pssBin, args...)
-	cmd.Env = append(os.Environ(),
-		"STADIA_KEY="+os.Getenv("STADIA_KEY"),
-		"MAPTILER_KEY="+os.Getenv("MAPTILER_KEY"),
-	)
+	_ = sendChatAction(bot, chatID, "typing")
+	outGIF, err := renderWithConfig(ctx, files, &cfg)
+	// очищаем очередь
+	cleanTemp(st.clearFiles())
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = io.MultiWriter(&stdout, lineTap(func(line string) { dbg.Println("[stdout]", line) }))
-	cmd.Stderr = io.MultiWriter(&stderr, lineTap(func(line string) { dbg.Println("[stderr]", line) }))
-
-	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		dbg.Flush()
-		send(chatID, "❌ Ошибка рендера:\n"+tail(stderr.String(), 40))
-		return
-	}
-	dbg.Println("Render completed in", time.Since(start).Round(time.Second).String())
-	dbg.Flush()
-
-	// --- Отправка результата --- //
-	send(chatID, "📤 Отправляю результат…")
-
-	// Опционально: ужать GIF перед проверкой размера (если установлен gifsicle)
-	tryShrinkGIF(outPath)
-
-	gifSize := fileSize(outPath)
-	caption := fmt.Sprintf("✅ Готово • %s • %d трек(ов) • %.1f MB",
-		tilesPreset, len(s.Files), float64(gifSize)/(1024*1024))
-
-	sent := false
-
-	if gifSize > 0 && gifSize <= maxBotUpload {
-		// Небольшие гифки пробуем как анимацию
-		anim := tgbotapi.NewAnimation(chatID, tgbotapi.FilePath(outPath))
-		anim.Caption = caption
-		if _, err := bot.Send(anim); err == nil {
-			sent = true
-		} else {
-			// Попробуем как документ
-			doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(outPath))
-			doc.Caption = caption
-			if _, err2 := bot.Send(doc); err2 == nil {
-				sent = true
-			} else {
-				send(chatID, "⚠️ Отправка GIF не удалась, пробую MP4…")
-			}
-		}
-	}
-
-	if !sent {
-		// либо GIF > лимита, либо отправка не прошла — делаем MP4
-		mp4Path := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".mp4"
-		if err := tryTranscodeGIFtoMP4(outPath, mp4Path); err != nil {
-			send(chatID, "❌ Не удалось перекодировать в MP4: "+err.Error())
-		} else {
-			mp4Size := fileSize(mp4Path)
-			captionMP4 := fmt.Sprintf("✅ Готово (MP4) • %s • %d трек(ов) • %.1f MB",
-				tilesPreset, len(s.Files), float64(mp4Size)/(1024*1024))
-
-			vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(mp4Path))
-			vid.Caption = captionMP4
-			if _, err := bot.Send(vid); err != nil {
-				send(chatID, "❌ Не удалось отправить видео: "+err.Error())
-			} else {
-				sent = true
-			}
-			_ = os.Remove(mp4Path)
-		}
-	}
-
-	_ = os.Remove(outPath)
-	clearSession(chatID)
-
-	if sent {
-		sendKB(chatID, "📦 Готово. Файлы очищены, сессия сброшена. Можете загрузить новые GPX и выбрать карту кнопкой ниже.")
-	}
-}
-
-// ---------- Sessions ----------
-
-func addFile(chatID int64, path string) {
-	sessMu.Lock()
-	defer sessMu.Unlock()
-	s := sessions[chatID]
-	if s == nil {
-		s = &Session{}
-		sessions[chatID] = s
-	}
-	s.Files = append(s.Files, path)
-	s.UpdatedAt = time.Now()
-}
-
-func markInvoker(chatID int64, m *tgbotapi.Message) {
-	sessMu.Lock()
-	defer sessMu.Unlock()
-	s := sessions[chatID]
-	if s == nil {
-		s = &Session{}
-		sessions[chatID] = s
-	}
-	s.LastUserID = m.From.ID
-	s.LastUser = strings.ToLower(m.From.UserName)
-	s.UpdatedAt = time.Now()
-}
-
-func clearSession(chatID int64) {
-	sessMu.Lock()
-	defer sessMu.Unlock()
-	if s, ok := sessions[chatID]; ok {
-		for _, f := range s.Files {
-			_ = os.Remove(f)
-		}
-		delete(sessions, chatID)
-	}
-}
-
-func gcSessions() {
-	t := time.NewTicker(10 * time.Minute)
-	defer t.Stop()
-	for range t.C {
-		now := time.Now()
-		sessMu.Lock()
-		for id, s := range sessions {
-			if now.Sub(s.UpdatedAt) > sessionTTL {
-				for _, f := range s.Files {
-					_ = os.Remove(f)
-				}
-				delete(sessions, id)
-			}
-		}
-		sessMu.Unlock()
-	}
-}
-
-// ---------- Debug streamer ----------
-
-type debugStreamer struct {
-	enabled bool
-	chatID  int64
-	buf     bytes.Buffer
-	mu      sync.Mutex
-	last    time.Time
-}
-
-func newDebugStreamer(chatID int64, m *tgbotapi.Message) *debugStreamer {
-	ok := isDebugAllowed(m)
-	return &debugStreamer{
-		enabled: ok,
-		chatID:  chatID,
-		last:    time.Now(),
-	}
-}
-
-func (d *debugStreamer) Println(parts ...interface{}) {
-	if !d.enabled {
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	fmt.Fprintln(&d.buf, fmt.Sprint(parts...))
-	// отправляем батч каждые ~2s или если буфер > 1200 символов
-	if time.Since(d.last) > 2*time.Second || d.buf.Len() > 1200 {
-		d.flushLocked()
-	}
-}
-
-func (d *debugStreamer) Flush() {
-	if !d.enabled {
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.buf.Len() > 0 {
-		d.flushLocked()
-	}
-}
-
-func (d *debugStreamer) flushLocked() {
-	text := d.buf.String()
-	d.buf.Reset()
-	d.last = time.Now()
-	if text == "" {
-		return
-	}
-	send(d.chatID, "```log\n"+elide(text, 3500)+"\n```") // код-блок для читабельности
-}
-
-func isDebugAllowed(m *tgbotapi.Message) bool {
-	if m == nil || m.From == nil {
-		return false
-	}
-	if debugAdmins[m.From.ID] {
-		return true
-	}
-	user := strings.ToLower(m.From.UserName)
-	if user != "" && debugUsers[user] {
-		return true
-	}
-	return false
-}
-
-func parseDebugAdmins(s string) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return
-	}
-	for _, tok := range strings.Split(s, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "" {
-			continue
-		}
-		if strings.HasPrefix(tok, "@") {
-			debugUsers[strings.ToLower(strings.TrimPrefix(tok, "@"))] = true
-			continue
-		}
-		if id, err := strconv.ParseInt(tok, 10, 64); err == nil {
-			debugAdmins[id] = true
-		}
-	}
-}
-
-// ---------- Telegram helpers ----------
-
-func send(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	_, _ = bot.Send(msg)
-}
-
-func sendKB(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = mainKB
-	_, _ = bot.Send(msg)
-}
-
-func downloadTGFile(fileID, dst string) error {
-	fc, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
-		return err
+		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Ошибка рендера: "+err.Error()))
+		return
 	}
-	resp, err := http.Get(fc.Link(bot.Token))
+	defer os.Remove(outGIF)
+
+	if err := sendResult(ctx, bot, chatID, outGIF,
+		fmt.Sprintf("Готово ✅ (%d GPX) · карта=%s", len(files), cfg.TilesPreset)); err != nil {
+		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Ошибка отправки: "+err.Error()))
+	}
+}
+
+/*************** Скачивание / утилиты ****************/
+
+func maybeDownload(bot *tgbotapi.BotAPI, d *tgbotapi.Document) string {
+	if d == nil {
+		return ""
+	}
+	name := d.FileName
+	if name == "" {
+		name = "file.gpx"
+	}
+	f, err := bot.GetFile(tgbotapi.FileConfig{FileID: d.FileID})
 	if err != nil {
-		return err
+		return ""
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("telegram file HTTP %d", resp.StatusCode)
-	}
-	tmp := dst + ".part"
-	out, err := os.Create(tmp)
+	url := f.Link(bot.Token)
+
+	tmpDir := filepath.Join(os.TempDir(), "pssbot")
+	_ = os.MkdirAll(tmpDir, 0o755)
+	dst := filepath.Join(tmpDir, sanitize(name))
+	out, err := os.Create(dst)
 	if err != nil {
-		return err
+		return ""
 	}
 	defer out.Close()
-	if _, err = io.Copy(out, resp.Body); err != nil {
-		return err
+
+	resp, err := http.Get(url)
+	if err != nil {
+		_ = os.Remove(dst)
+		return ""
 	}
-	return os.Rename(tmp, dst)
-}
-
-// ---------- Utils ----------
-
-func lineTap(cb func(string)) io.Writer {
-	pr, pw := io.Pipe()
-	go func() {
-		r := bufio.NewScanner(pr)
-		const max = 1024 * 1024
-		r.Buffer(make([]byte, 0, 64*1024), max)
-		for r.Scan() {
-			cb(r.Text())
-		}
-	}()
-	return pw
-}
-
-func elide(s string, n int) string {
-	rs := []rune(s)
-	if len(rs) <= n {
-		return s
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		_ = os.Remove(dst)
+		return ""
 	}
-	return string(rs[:n]) + "…"
-}
-
-func tail(s string, n int) string {
-	ls := strings.Split(s, "\n")
-	if len(ls) <= n {
-		return s
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		_ = os.Remove(dst)
+		return ""
 	}
-	return strings.Join(ls[len(ls)-n:], "\n")
+	return dst
 }
 
 func sanitize(name string) string {
-	name = filepath.Base(name)
-	name = strings.ReplaceAll(name, "..", "")
+	name = strings.ReplaceAll(name, "..", "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "\\", "_")
 	return name
 }
 
-func must(err error) {
-	if err != nil {
-		panic(err)
+func cleanTemp(paths []string) {
+	for _, p := range paths {
+		_ = os.Remove(p)
 	}
 }
 
-func mustEnv(k string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		panic("missing " + k)
+func renderWithConfig(ctx context.Context, gpx []string, cfg *renderConfig) (string, error) {
+	if len(gpx) == 0 {
+		return "", errors.New("no gpx")
 	}
-	return v
-}
+	tmpDir := filepath.Join(os.TempDir(), "pssbot")
+	_ = os.MkdirAll(tmpDir, 0o755)
+	out := filepath.Join(tmpDir, fmt.Sprintf("track_%d.gif", time.Now().UnixNano()))
 
-func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+	args := cfg.args(out, gpx)
+	cmd := exec.CommandContext(ctx, rendererPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("run: %s %s", rendererPath, strings.Join(args, " "))
+	if err := cmd.Run(); err != nil {
+		return "", err
 	}
-	return def
-}
-
-func fileSize(path string) int64 {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0
+	if st, err := os.Stat(out); err != nil || st.Size() == 0 {
+		return "", fmt.Errorf("renderer output not found: %s", out)
 	}
-	return fi.Size()
+	return out, nil
 }
 
-func tryShrinkGIF(inPath string) {
-	// если есть gifsicle — попробуем слегка ужать (lossy=60). Ошибки игнорим.
-	cmd := exec.Command("gifsicle", "-O3", "--lossy=60", "-o", inPath, inPath)
-	_ = cmd.Run()
-}
+/*************** Telegram helpers ****************/
 
-func tryTranscodeGIFtoMP4(gifPath, mp4Path string) error {
-	// Неболтливый ffmpeg, совместимый профиль для Telegram
-	cmd := exec.Command(
-		"ffmpeg",
-		"-y",
-		"-hide_banner",
-		"-loglevel", "error",
-		"-i", gifPath,
-		"-movflags", "+faststart",
-		"-pix_fmt", "yuv420p",
-		"-c:v", "libx264",
-		"-preset", "fast",
-		"-crf", "26", // ниже — качество выше и размер больше (24..30)
-		"-vf", "scale=1024:-2:flags=lanczos,fps=20",
-		mp4Path,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg: %v: %s", err, string(out))
+func sendText(bot *tgbotapi.BotAPI, chatID int64, text string, markdown bool) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if markdown {
+		msg.ParseMode = "Markdown"
 	}
-	return nil
-}
-
-// ---------- Help ----------
-
-func helpText() string {
-	return `👋 psstelebot: конвертирует GPX → GIF.
-
-Как пользоваться:
-1) Пришлите 1..N GPX-файлов документами.
-2) Затем:
-   • нажмите кнопку снизу «Топографическая карта» или «Спутниковая карта», ИЛИ
-   • используйте команды:
-/rendertop — tilesPreset=opentopomap
-/rendersat — tilesPreset=esri-satellite
-
-Параметры фиксированы:
--size 1024 -fps 20 -duration 15s
--tilesMaxZoom 16 -tilesMinZoom 12
--tilesRetries 3 -tilesRetryBackoff 2s
--tilesTimeout 45s -tilesRPS 0.5 -tilesBurst 1
--tileFit cover -margin 0.02
--lineColors "#e74c3c,#3498db"
--speedOverlay -speedUnits kmh -speedSmooth 1
--lineWidth 3 -timeout 60m
-
-Админам (DEBUG_ADMINS): подробный лог рендера приходит отдельными сообщениями.
-/clear — очистить сессию и удалить загруженные GPX.`
+	_, err := bot.Send(msg)
+	return err
 }

@@ -1,440 +1,191 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"image"
 	"image/color"
-	"image/color/palette"
-	"image/draw"
 	"math"
-	"time"
-
-	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
 )
 
-// один палетизированный кадр
-type PalFrame struct {
-	Img   *image.Paletted
-	Delay int // hundredths of a second
-}
+type Pt struct{ X, Y int }
+type PtF struct{ X, Y float64 }
 
-type boundsLL struct {
-	minLat, maxLat float64
-	minLon, maxLon float64
-}
-
-func bboxLL(pts []PtLL) boundsLL {
-	minLat, maxLat := math.MaxFloat64, -math.MaxFloat64
-	minLon, maxLon := math.MaxFloat64, -math.MaxFloat64
-	for _, p := range pts {
-		if p.Lat < minLat {
-			minLat = p.Lat
-		}
-		if p.Lat > maxLat {
-			maxLat = p.Lat
-		}
-		if p.Lon < minLon {
-			minLon = p.Lon
-		}
-		if p.Lon > maxLon {
-			maxLon = p.Lon
-		}
-	}
-	return boundsLL{minLat, maxLat, minLon, maxLon}
-}
-
-// ==== Web Mercator helpers (нормализованные координаты [0..1]) ====
-
-func mercX(lon float64) float64 { // lon (deg) -> [0..1]
-	return (lon + 180.0) / 360.0
-}
-
-func mercY(lat float64) float64 { // lat (deg) -> [0..1]
-	if lat > 85.05112878 {
-		lat = 85.05112878
-	}
-	if lat < -85.05112878 {
-		lat = -85.05112878
-	}
-	r := lat * math.Pi / 180.0
-	return 0.5 - math.Log((1+math.Sin(r))/(1-math.Sin(r)))/(4*math.Pi)
-}
-
-func invMercY(y float64) float64 { // [0..1] -> lat (deg)
-	t := math.Pi * (1 - 2*y)
-	return (180 / math.Pi) * math.Atan(math.Sinh(t))
-}
-
-// ==== Рендер анимации (используем единый viewport из main.go) ====
-
-func BuildFramesMulti(
-	ctx context.Context,
-	tracks [][]PtLL,
-	sizePx, total int,
-	margin float64, // оставлен для совместимости, внутри не используем
-	bg color.Color,
-	trackColors []color.Color,
-	trackWidth int,
-	base image.Image,
-	bbLL boundsLL, // единый viewport из main.go (после padding/cover/inset)
-) ([]*PalFrame, []int, error) {
-
-	// подготовим меркаторный bbox (нормализованные координаты)
-	type boundsMerc struct{ minX, minY, maxX, maxY float64 }
-
-	xMin := mercX(bbLL.minLon)
-	xMax := mercX(bbLL.maxLon)
-
-	// ВАЖНО: в меркаторе "верх" (maxLat) имеет меньшее значение y, чем "низ" (minLat)
-	yTop := mercY(bbLL.maxLat)    // верх кадра
-	yBottom := mercY(bbLL.minLat) // низ кадра
-
-	bm := boundsMerc{
-		minX: math.Min(xMin, xMax),
-		maxX: math.Max(xMin, xMax),
-		minY: math.Min(yTop, yBottom), // численно меньшее — это верх
-		maxY: math.Max(yTop, yBottom), // численно большее — это низ
-	}
-
-	project := func(p PtLL) (int, int) {
-		x := mercX(p.Lon)
-		y := mercY(p.Lat)
-		dx := bm.maxX - bm.minX
-		dy := bm.maxY - bm.minY
-		if dx == 0 {
-			dx = 1e-12
-		}
-		if dy == 0 {
-			dy = 1e-12
-		}
-		fx := (x - bm.minX) / dx
-		fy := (y - bm.minY) / dy
-		if fx < 0 {
-			fx = 0
-		} else if fx > 1 {
-			fx = 1
-		}
-		if fy < 0 {
-			fy = 0
-		} else if fy > 1 {
-			fy = 1
-		}
-		px := int(math.Round(fx * float64(sizePx-1)))
-		py := int(math.Round(fy * float64(sizePx-1)))
-		return px, py
-	}
-
-	// найдём глобальный диапазон времени
-	hasTime := false
-	var minT, maxT time.Time
-	for _, pts := range tracks {
-		for _, p := range pts {
-			if p.T == nil {
-				continue
-			}
-			if !hasTime {
-				minT, maxT = *p.T, *p.T
-				hasTime = true
-			} else {
-				if p.T.Before(minT) {
-					minT = *p.T
-				}
-				if p.T.After(maxT) {
-					maxT = *p.T
-				}
-			}
-		}
-	}
-
-	frames := make([]*PalFrame, 0, total)
-	delays := make([]int, 0, total)
-
-	// Без времени: синхронизация по индексу
-	if !hasTime {
-		maxPts := 0
-		for _, pts := range tracks {
-			if len(pts) > maxPts {
-				maxPts = len(pts)
-			}
-		}
-		if maxPts < 2 {
-			maxPts = 2
-		}
-		step := math.Max(1, float64(maxPts-1)/float64(total))
-
-		for fi := 0; fi < total; fi++ {
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			default:
-			}
-
-			rgba := image.NewRGBA(image.Rect(0, 0, sizePx, sizePx))
-			if base != nil {
-				draw.Draw(rgba, rgba.Bounds(), base, image.Point{}, draw.Src)
-			} else {
-				draw.Draw(rgba, rgba.Bounds(), &image.Uniform{C: bg}, image.Point{}, draw.Src)
-			}
-
-			upto := int(math.Round(step * float64(fi+1)))
-
-			for tIdx, pts := range tracks {
-				if len(pts) < 2 {
-					continue
-				}
-				endIdx := min(len(pts)-1, upto)
-				col := trackColors[tIdx%len(trackColors)]
-				for i := 0; i < endIdx; i++ {
-					x1, y1 := project(pts[i])
-					x2, y2 := project(pts[i+1])
-					drawLineRGBA(rgba, x1, y1, x2, y2, trackWidth, col)
-				}
-			}
-
-			pimg := image.NewPaletted(rgba.Bounds(), palette.Plan9)
-			draw.FloydSteinberg.Draw(pimg, pimg.Bounds(), rgba, image.Point{})
-			frames = append(frames, &PalFrame{Img: pimg, Delay: 5}) // 5 → ~20fps
-			delays = append(delays, 5)
-		}
-		return frames, delays, nil
-	}
-
-	// С временем: равномерно от minT до maxT
-	if total < 2 {
-		total = 2
-	}
-	totalDur := maxT.Sub(minT)
-	cursor := make([]int, len(tracks)) // индекс последней точки <= frameT
-
-	for fi := 0; fi < total; fi++ {
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		default:
-		}
-
-		var frameT time.Time
-		if fi == total-1 {
-			frameT = maxT
-		} else {
-			frameT = minT.Add(time.Duration(float64(totalDur) * float64(fi) / float64(total-1)))
-		}
-
-		rgba := image.NewRGBA(image.Rect(0, 0, sizePx, sizePx))
-		if base != nil {
-			draw.Draw(rgba, rgba.Bounds(), base, image.Point{}, draw.Src)
-		} else {
-			draw.Draw(rgba, rgba.Bounds(), &image.Uniform{C: bg}, image.Point{}, draw.Src)
-		}
-
-		for tIdx, pts := range tracks {
-			if len(pts) < 2 {
-				continue
-			}
-
-			i := cursor[tIdx]
-			for i+1 < len(pts) {
-				tNext := pts[i+1].T
-				if tNext == nil || tNext.After(frameT) {
-					break
-				}
-				i++
-			}
-			cursor[tIdx] = i
-
-			endIdx := i
-			if endIdx >= len(pts)-1 {
-				endIdx = len(pts) - 1
-			}
-			if endIdx < 1 {
-				continue
-			}
-
-			col := trackColors[tIdx%len(trackColors)]
-			for k := 0; k < endIdx; k++ {
-				x1, y1 := project(pts[k])
-				x2, y2 := project(pts[k+1])
-				drawLineRGBA(rgba, x1, y1, x2, y2, trackWidth, col)
-			}
-		}
-
-		pimg := image.NewPaletted(rgba.Bounds(), palette.Plan9)
-		draw.FloydSteinberg.Draw(pimg, pimg.Bounds(), rgba, image.Point{})
-		frames = append(frames, &PalFrame{Img: pimg, Delay: 5})
-		delays = append(delays, 5)
-	}
-	return frames, delays, nil
-}
-
-// ===== низкоуровневый рисовальщик толстой линии (квадратная «кисть») =====
-
-func drawLineRGBA(img *image.RGBA, x0, y0, x1, y1, width int, c color.Color) {
-	dx := int(math.Abs(float64(x1 - x0)))
-	sx := -1
-	if x0 < x1 {
-		sx = 1
-	}
-	dy := -int(math.Abs(float64(y1 - y0)))
-	sy := -1
-	if y0 < y1 {
-		sy = 1
-	}
-	err := dx + dy
-	for {
-		plotSquareRGBA(img, x0, y0, width, c)
-		if x0 == x1 && y0 == y1 {
-			break
-		}
-		e2 := 2 * err
-		if e2 >= dy {
-			err += dy
-			x0 += sx
-		}
-		if e2 <= dx {
-			err += dx
-			y0 += sy
-		}
-	}
-}
-
-func plotSquareRGBA(img *image.RGBA, cx, cy, w int, c color.Color) {
-	if w <= 1 {
-		if image.Pt(cx, cy).In(img.Rect) {
-			img.Set(cx, cy, c)
-		}
+// --- Блендинг прямого альфа-канала поверх RGBA ---
+func blendOver(dst *image.RGBA, x, y int, c color.NRGBA, cov float64) {
+	if x < dst.Rect.Min.X || x >= dst.Rect.Max.X || y < dst.Rect.Min.Y || y >= dst.Rect.Max.Y {
 		return
 	}
-	r := (w - 1) / 2
-	for y := cy - r; y <= cy+r; y++ {
-		for x := cx - r; x <= cx+r; x++ {
-			if image.Pt(x, y).In(img.Rect) {
-				img.Set(x, y, c)
-			}
-		}
-	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-/*** ===================== HUD (легенда + скорости) ===================== ***/
-
-type hudTrack struct {
-	Name   string
-	Color  color.Color
-	Speeds []float64 // м/с
-	Pts    []PtLL    // для доступа к T и длине
-}
-
-func hudDrawLegend(dst draw.Image, tracks []hudTrack) {
-	if len(tracks) == 0 {
+	if cov <= 0 {
 		return
 	}
-	padding := 10
-	lineH := 16
-	swatch := 12
+	i := dst.PixOffset(x, y)
 
-	face := basicfont.Face7x13
-	maxW := 0
-	for _, tr := range tracks {
-		w := font.MeasureString(face, tr.Name).Ceil()
-		if w > maxW {
-			maxW = w
-		}
-	}
-	boxW := padding*3 + swatch + maxW
-	boxH := padding*2 + lineH*len(tracks)
-
-	fillRect(dst, image.Rect(padding, padding, padding+boxW, padding+boxH), color.RGBA{0, 0, 0, 255})
-
-	x := padding * 2
-	y := padding + lineH
-	for _, tr := range tracks {
-		fillRect(dst, image.Rect(x, y-swatch+3, x+swatch, y+3), tr.Color)
-		drawString(dst, x+swatch+6, y, tr.Name, color.RGBA{255, 255, 255, 255})
-		y += lineH
-	}
-}
-
-func hudDrawSpeeds(dst draw.Image, tracks []hudTrack, tNow time.Time, units string) {
-	if len(tracks) == 0 {
+	da := float64(dst.Pix[i+3]) / 255.0
+	a := float64(c.A)/255.0 * cov
+	outA := a + da*(1-a)
+	if outA <= 1e-6 {
+		dst.Pix[i+0], dst.Pix[i+1], dst.Pix[i+2], dst.Pix[i+3] = 0, 0, 0, 0
 		return
 	}
-	padding := 10
-	lineH := 16
-	face := basicfont.Face7x13
-	unitLabel := map[string]string{"kmh": "км/ч", "ms": "м/с", "mph": "mph"}[units]
-	if unitLabel == "" {
-		unitLabel = "м/с"
+
+	dr := float64(dst.Pix[i+0])
+	dg := float64(dst.Pix[i+1])
+	db := float64(dst.Pix[i+2])
+	sr := float64(c.R)
+	sg := float64(c.G)
+	sb := float64(c.B)
+
+	dst.Pix[i+0] = byte(clamp255((sr*a + dr*da*(1-a)) / outA))
+	dst.Pix[i+1] = byte(clamp255((sg*a + dg*da*(1-a)) / outA))
+	dst.Pix[i+2] = byte(clamp255((sb*a + db*da*(1-a)) / outA))
+	dst.Pix[i+3] = byte(clamp255(outA * 255.0))
+}
+
+func clamp255(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 255 {
+		return 255
+	}
+	return x
+}
+
+func fpart(x float64) float64  { return x - math.Floor(x) }
+func rfpart(x float64) float64 { return 1 - fpart(x) }
+
+// Xiaolin Wu — антиалиасная тонкая линия
+func lineAA(dst *image.RGBA, x0, y0, x1, y1 float64, col color.NRGBA) {
+	steep := math.Abs(y1-y0) > math.Abs(x1-x0)
+	if steep {
+		x0, y0 = y0, x0
+		x1, y1 = y1, x1
+	}
+	if x0 > x1 {
+		x0, x1 = x1, x0
+		y0, y1 = y1, y0
+	}
+	dx := x1 - x0
+	grad := 0.0
+	if dx != 0 {
+		grad = (y1 - y0) / dx
 	}
 
-	lines := make([]string, 0, len(tracks))
-	maxW := 0
-	for _, tr := range tracks {
-		idx := lastIndexBeforeOrAtPt(tr.Pts, tNow)
-		speed := 0.0
-		if idx >= 0 && idx < len(tr.Speeds) {
-			speed = convertSpeed(tr.Speeds[idx], units)
-		}
-		line := fmt.Sprintf("%s — %.1f %s", tr.Name, speed, unitLabel)
-		lines = append(lines, line)
-		w := font.MeasureString(face, line).Ceil()
-		if w > maxW {
-			maxW = w
-		}
+	xend := math.Round(x0)
+	yend := y0 + grad*(xend-x0)
+	xgap := rfpart(x0 + 0.5)
+	xpxl1 := int(xend)
+	ypxl1 := int(math.Floor(yend))
+	if steep {
+		blendOver(dst, ypxl1, xpxl1, col, rfpart(yend)*xgap)
+		blendOver(dst, ypxl1+1, xpxl1, col, fpart(yend)*xgap)
+	} else {
+		blendOver(dst, xpxl1, ypxl1, col, rfpart(yend)*xgap)
+		blendOver(dst, xpxl1, ypxl1+1, col, fpart(yend)*xgap)
 	}
+	intery := yend + grad
 
-	boxW := padding*2 + maxW
-	boxH := padding*2 + lineH*len(lines)
+	xend2 := math.Round(x1)
+	yend2 := y1 + grad*(xend2-x1)
+	xgap2 := fpart(x1 + 0.5)
+	xpxl2 := int(xend2)
+	ypxl2 := int(math.Floor(yend2))
 
-	b := dst.Bounds()
-	x0 := b.Max.X - boxW - padding
-	y0 := padding
-	fillRect(dst, image.Rect(x0, y0, x0+boxW, y0+boxH), color.RGBA{0, 0, 0, 255})
-
-	x := x0 + padding
-	y := y0 + lineH
-	for i, tr := range tracks {
-		fillRect(dst, image.Rect(x-10, y-8, x-4, y-2), tr.Color)
-		drawString(dst, x, y, lines[i], color.RGBA{255, 255, 255, 255})
-		y += lineH
+	if steep {
+		for x := xpxl1 + 1; x <= xpxl2-1; x++ {
+			yy := int(math.Floor(intery))
+			blendOver(dst, yy, x, col, rfpart(intery))
+			blendOver(dst, yy+1, x, col, fpart(intery))
+			intery += grad
+		}
+		blendOver(dst, ypxl2, xpxl2, col, rfpart(yend2)*xgap2)
+		blendOver(dst, ypxl2+1, xpxl2, col, fpart(yend2)*xgap2)
+	} else {
+		for x := xpxl1 + 1; x <= xpxl2-1; x++ {
+			yy := int(math.Floor(intery))
+			blendOver(dst, x, yy, col, rfpart(intery))
+			blendOver(dst, x, yy+1, col, fpart(intery))
+			intery += grad
+		}
+		blendOver(dst, xpxl2, ypxl2, col, rfpart(yend2)*xgap2)
+		blendOver(dst, xpxl2, ypxl2+1, col, fpart(yend2)*xgap2)
 	}
 }
 
-// ===== мелкие хелперы для HUD =====
-
-func fillRect(dst draw.Image, r image.Rectangle, c color.Color) {
-	draw.Draw(dst, r, &image.Uniform{C: c}, image.Point{}, draw.Over)
-}
-
-func drawString(dst draw.Image, x, y int, s string, col color.Color) {
-	d := &font.Drawer{
-		Dst:  dst,
-		Src:  &image.Uniform{C: col},
-		Face: basicfont.Face7x13,
-		Dot:  fixed.P(x, y),
+func fillDiscAA(dst *image.RGBA, cx, cy int, r float64, col color.NRGBA) {
+	if r <= 0.5 {
+		blendOver(dst, cx, cy, col, 1)
+		return
 	}
-	d.DrawString(s)
-}
-
-func lastIndexBeforeOrAtPt(pts []PtLL, t time.Time) int {
-	lo, hi := 0, len(pts)-1
-	ans := -1
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		if pts[mid].T == nil || pts[mid].T.After(t) {
-			hi = mid - 1
-		} else {
-			ans = mid
-			lo = mid + 1
+	minY := int(math.Floor(float64(cy) - r))
+	maxY := int(math.Ceil(float64(cy) + r))
+	for y := minY; y <= maxY; y++ {
+		dy := math.Abs(float64(y) - float64(cy))
+		if dy > r {
+			continue
 		}
+		wx := math.Sqrt(r*r - dy*dy)
+		x0 := float64(cx) - wx
+		x1 := float64(cx) + wx
+		for x := int(math.Ceil(x0)); x <= int(math.Floor(x1)); x++ {
+			blendOver(dst, x, y, col, 1.0)
+		}
+		blendOver(dst, int(math.Floor(x0)), y, col, rfpart(x0))
+		blendOver(dst, int(math.Ceil(x1)), y, col, fpart(x1))
 	}
-	return ans
+}
+
+// Публичная: рисуем сегмент по **float** координатам с толщиной и круглыми торцами.
+func drawSegmentRGBA(dst *image.RGBA, a, b PtF, col color.NRGBA, width float32) {
+	w := float64(width)
+	if w < 1 {
+		w = 1
+	}
+	ax, ay := a.X, a.Y
+	bx, by := b.X, b.Y
+
+	dx, dy := bx-ax, by-ay
+	L := math.Hypot(dx, dy)
+	if L < 1e-6 {
+		fillDiscAA(dst, int(math.Round(ax)), int(math.Round(ay)), w/2, col)
+		return
+	}
+	nx, ny := -dy/L, dx/L
+
+	if w <= 1.01 {
+		lineAA(dst, ax, ay, bx, by, col)
+		fillDiscAA(dst, int(math.Round(ax)), int(math.Round(ay)), 0.5, col)
+		fillDiscAA(dst, int(math.Round(bx)), int(math.Round(by)), 0.5, col)
+		return
+	}
+
+	half := (w - 1.0) / 2.0
+	maxOffset := math.Ceil(half)
+	for o := -maxOffset; o <= maxOffset; o++ {
+		t := float64(o)
+		edge := math.Max(0, 1.0-math.Abs(t)/(half+0.001))
+		cc := col
+		cc.A = uint8(edge * float64(col.A))
+		ox := nx * t
+		oy := ny * t
+		lineAA(dst, ax+ox, ay+oy, bx+ox, by+oy, cc)
+	}
+	fillDiscAA(dst, int(math.Round(ax)), int(math.Round(ay)), w/2, col)
+	fillDiscAA(dst, int(math.Round(bx)), int(math.Round(by)), w/2, col)
+}
+
+func dirtyRectF(a, b PtF, pad float64) image.Rectangle {
+	minx, maxx := a.X, b.X
+	if b.X < a.X {
+		minx, maxx = b.X, a.X
+	}
+	miny, maxy := a.Y, b.Y
+	if b.Y < a.Y {
+		miny, maxy = b.Y, a.Y
+	}
+	return image.Rect(
+		int(math.Floor(minx-pad)),
+		int(math.Floor(miny-pad)),
+		int(math.Ceil(maxx+pad))+1,
+		int(math.Ceil(maxy+pad))+1,
+	)
 }
