@@ -13,23 +13,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// Конвертация GIF → MP4 с той же визуальной скоростью.
-// 1) Разворачиваем частичные кадры GIF в полноразмерные PNG с учётом Disposal.
-// 2) Выбираем базовый FPS по МОДЕ задержек (в центисекундах), а не по НОД.
-// 3) Дублируем каждый PNG столько раз, чтобы выдержать его задержку при CFR.
-// 4) Кодируем через image2: -framerate <fps> -i seq_%06d.png -r <fps> -fps_mode cfr.
+// Конвертация GIF → MP4 с точными задержками (VFR) + настраиваемый коэффициент скорости.
+// PSS_MP4_SPEED (float, по умолчанию 1.0) умножает все duration ( >1.0 = медленнее, <1.0 = быстрее).
 func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return "", fmt.Errorf("ffmpeg not found in PATH")
 	}
 
-	// читаем GIF
+	// 1) читаем GIF
 	gf, err := os.Open(gifPath)
 	if err != nil {
 		return "", err
@@ -55,27 +53,29 @@ func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 		}
 	}
 
-	// рабочая папка
+	// 2) рабочая папка
 	work, err := os.MkdirTemp("", "pss_mp4_*")
 	if err != nil {
 		return "", err
 	}
+	// подчистим после
 	defer func() { _ = os.RemoveAll(work) }()
 
-	// разворачиваем частичные кадры в полноразмерные PNG
+	// 3) разворачиваем частичные кадры в полноразмерные PNG
 	canvas := image.NewRGBA(fullRect)
 	clearRect(canvas, fullRect, bg)
 
 	n := len(g.Image)
 	framePNG := make([]string, n)
-	delaysCS := make([]int, n)
+	delaySec := make([]float64, n) // задержки в секундах
 
 	var prev *image.RGBA
+	totalGIF := 0.0
 	for i := 0; i < n; i++ {
 		frame := g.Image[i] // *image.Paletted
 		fr := frame.Bounds()
 
-		// disposal для ТЕКУЩЕГО кадра
+		// disposal для текущего кадра (byte)
 		dis := byte(gif.DisposalNone)
 		if i < len(g.Disposal) {
 			dis = g.Disposal[i]
@@ -88,17 +88,17 @@ func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 			prev = nil
 		}
 
-		// рисуем частичный кадр
+		// рисуем частичный кадр на холст
 		draw.Draw(canvas, fr, frame, fr.Min, draw.Over)
 
-		// сохраняем полный PNG текущего состояния
+		// сохраняем полный PNG
 		fn := filepath.Join(work, fmt.Sprintf("frame_%05d.png", i))
 		if err := savePNG(fn, canvas); err != nil {
 			return "", err
 		}
 		framePNG[i] = fn
 
-		// нормализуем задержку (в cs — 1/100 s)
+		// задержка кадра из GIF → секунды (Delay — в 1/100 s); нули нормализуем
 		cs := 10 // дефолт 0.10s
 		if i < len(g.Delay) && g.Delay[i] > 0 {
 			cs = g.Delay[i]
@@ -106,9 +106,11 @@ func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 		if cs < 1 {
 			cs = 1
 		}
-		delaysCS[i] = cs
+		sec := float64(cs) / 100.0
+		delaySec[i] = sec
+		totalGIF += sec
 
-		// подготавливаем холст к СЛЕДУЮЩЕМУ кадру в соответствии с disposal
+		// подготовка к следующему кадру по disposal
 		switch dis {
 		case byte(gif.DisposalNone):
 			// оставляем как есть
@@ -123,81 +125,53 @@ func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 		}
 	}
 
-	// базовый шаг: МОДА задержек (самое частое значение), а не НОД
-	modeCS := mostCommonCS(delaysCS)
-	if modeCS < 1 {
-		modeCS = 5 // страховка
-	}
-	baseFPS := 100 / modeCS
-	if baseFPS < 1 {
-		baseFPS = 1
-	}
-	if baseFPS > 60 {
-		baseFPS = 60
+	// 4) коэффициент скорости (>=0.2 .. <=5.0), по умолчанию 1.0
+	speed := readSpeedFactor()
+	if math.Abs(speed-1.0) > 1e-9 {
+		for i := range delaySec {
+			delaySec[i] *= speed
+		}
 	}
 
-	// готовим реальную последовательность кадров под CFR baseFPS
-	seqDir := filepath.Join(work, "seq")
-	if err := os.MkdirAll(seqDir, 0o755); err != nil {
+	// 5) формируем ffconcat-список (VFR) — file + duration для каждого кадра и file для последнего
+	listPath := filepath.Join(work, "list.txt")
+	lst, err := os.Create(listPath)
+	if err != nil {
 		return "", err
 	}
-
-	writeCopy := func(src, dst string) error {
-		// быстрый путь — хардлинк
-		if err := os.Link(src, dst); err == nil {
-			return nil
-		}
-		// иначе — быстрая копия
-		in, err := os.Open(src)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		out, err := os.Create(dst)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = out.Close() }()
-		if _, err := io.Copy(out, in); err != nil {
-			return err
-		}
-		return out.Sync()
-	}
-
-	index := 0
+	_, _ = io.WriteString(lst, "ffconcat version 1.0\n")
+	totalMP4 := 0.0
 	for i := 0; i < n; i++ {
-		// сколько «базовых шагов» в задержке этого кадра
-		reps := int(math.Round(float64(delaysCS[i]) / float64(modeCS)))
-		if reps < 1 {
-			reps = 1
+		abs, _ := filepath.Abs(framePNG[i])
+		_, _ = io.WriteString(lst, fmt.Sprintf("file '%s'\n", escapeFF(abs)))
+		d := delaySec[i]
+		if d < 0.005 {
+			d = 0.005 // минимальная разумная длительность, чтобы телега не «съела» кадр
 		}
-		for r := 0; r < reps; r++ {
-			dst := filepath.Join(seqDir, fmt.Sprintf("seq_%06d.png", index))
-			if err := writeCopy(framePNG[i], dst); err != nil {
-				return "", err
-			}
-			index++
-		}
+		_, _ = io.WriteString(lst, fmt.Sprintf("duration %.6f\n", d))
+		totalMP4 += d
 	}
-	if index == 0 {
-		return "", fmt.Errorf("no frames prepared for mp4")
+	// повторяем последний файл без duration
+	if n > 0 {
+		abs, _ := filepath.Abs(framePNG[n-1])
+		_, _ = io.WriteString(lst, fmt.Sprintf("file '%s'\n", escapeFF(abs)))
 	}
+	_ = lst.Close()
 
-	// ffmpeg: image2 → CFR baseFPS (Telegram больше не ускорит)
+	// 6) ffmpeg: concat (VFR) → MP4
 	out := filepath.Join(filepath.Dir(gifPath), trimExt(filepath.Base(gifPath))+".mp4")
-
 	args := []string{
 		"-y",
-		"-framerate", fmt.Sprintf("%d", baseFPS),            // входной fps
-		"-i", filepath.Join(seqDir, "seq_%06d.png"),        // image2
-		"-fps_mode", "cfr",
-		"-r", fmt.Sprintf("%d", baseFPS),                   // выходной CFR
-		"-movflags", "faststart",
-		"-an",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", listPath,
+		"-fflags", "+genpts",    // генерируем PTS по duration
+		"-vsync", "vfr",         // переменный FPS, уважаем duration
 		"-pix_fmt", "yuv420p",
 		"-c:v", "libx264",
 		"-preset", "veryfast",
 		"-crf", "23",
+		"-movflags", "faststart",
 		out,
 	}
 
@@ -211,31 +185,34 @@ func gifToMP4SameTiming(ctx context.Context, gifPath string) (string, error) {
 		return "", fmt.Errorf("ffmpeg: %w", err)
 	}
 
+	// необязательный лог в консоль, чтобы видеть расчетные длительности
+	fmt.Fprintf(os.Stderr, "[mp4] GIF dur=%.3fs, MP4 dur (target)=%.3fs, speed=%.3fx\n", totalGIF, totalMP4, speed)
+
 	return out, nil
 }
 
 /*************** helpers ***************/
 
-func mostCommonCS(a []int) int {
-	if len(a) == 0 {
-		return 5
+func readSpeedFactor() float64 {
+	s := strings.TrimSpace(os.Getenv("PSS_MP4_SPEED"))
+	if s == "" {
+		return 1.0
 	}
-	// округлим все экстремально маленькие/нулевые значения вверх до 1
-	cnt := map[int]int{}
-	for _, v := range a {
-		if v < 1 {
-			v = 1
-		}
-		cnt[v]++
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || !isFinite(v) {
+		return 1.0
 	}
-	// находим моду; при равенстве — берём наибольшую (обычно 5)
-	bestV, bestC := 5, -1
-	for v, c := range cnt {
-		if c > bestC || (c == bestC && v > bestV) {
-			bestV, bestC = v, c
-		}
+	if v < 0.2 {
+		v = 0.2
 	}
-	return bestV
+	if v > 5.0 {
+		v = 5.0
+	}
+	return v
+}
+
+func isFinite(x float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0)
 }
 
 func clearRect(dst *image.RGBA, r image.Rectangle, c color.Color) {
@@ -270,6 +247,11 @@ func savePNG(path string, img image.Image) error {
 
 func trimExt(name string) string {
 	return strings.TrimSuffix(name, filepath.Ext(name))
+}
+
+func escapeFF(p string) string {
+	// экранируем одинарные кавычки для ffconcat
+	return strings.ReplaceAll(p, "'", "'\\''")
 }
 
 func sendChatAction(bot *tgbotapi.BotAPI, chatID int64, action string) error {
