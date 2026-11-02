@@ -86,3 +86,20 @@ export MAPTILER_KEY=pk_xxxxxxxxxxxxxxxxx
   -tileFit cover \
   -lineColors "#34c759" \
   -lineWidth 5
+
+
+## Production Linux build
+
+Production runs the bot and renderer side by side in `/root/psstelebot`.
+The bot's development default is `./bin/psstelebot`, so the deployed build must
+set the renderer path explicitly. Preserve this linker setting when rebuilding:
+
+```sh
+GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/psstelebot ./cmd/psstelebot
+GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -X main.rendererPath=/root/psstelebot/psstelebot' -o dist/psstelebot-bot ./cmd/psstelebot-bot
+```
+
+Build from a clean fixed commit and retain its SHA, Go version, dependency list,
+build flags and artifact checksums. Back up both deployed binaries before replacing
+them together. Validate the renderer with a synthetic GPX before restarting the bot;
+never run a second polling process with the production token.
